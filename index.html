@@ -526,11 +526,16 @@ function detectFilterableColumns(floor){
   });
   return result;
 }
+function generateRowId(){
+  return "r" + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
+
 function normalizeFloor(floor){
   floor.hiddenColumns = floor.hiddenColumns || [];
   floor.columnWidths = floor.columnWidths || {};
   floor.rows = floor.rows || [];
   floor.statColumns = floor.statColumns || [];
+  floor.mapPins = floor.mapPins || [];
 
   // de-duplicate column names: two identically-named columns share one data
   // slot on each row, which made row-wide edits silently overwrite each other.
@@ -539,6 +544,15 @@ function normalizeFloor(floor){
     if(seenNames[c] === undefined){ seenNames[c] = 1; return c; }
     seenNames[c]++;
     return c + " (" + seenNames[c] + ")";
+  });
+
+  // every row needs a stable id (not just its array position) so map pins
+  // still point at the right unit after rows are added/deleted/reordered
+  floor.rows.forEach(r=>{ if(!r.__id) r.__id = generateRowId(); });
+  floor.mapPins.forEach(pin=>{
+    if(!pin.rowId && pin.rowIndex !== undefined && floor.rows[pin.rowIndex]){
+      pin.rowId = floor.rows[pin.rowIndex].__id;
+    }
   });
 
   if(!floor.filterColumns){
@@ -1877,6 +1891,7 @@ function addNewRow(){
   const newRow = {};
   floor.columns.forEach(c=> newRow[c] = "");
   newRow.__updatedAt = new Date().toISOString();
+  newRow.__id = generateRowId();
   floor.rows.push(newRow);
   editingRowKey = floor.rows.length - 1;
   flashRowIdx = floor.rows.length - 1;
@@ -2374,63 +2389,117 @@ function ensureLoggedIn(onSuccess){
 
 async function pullFromServer(){
   ensureLoggedIn(async ()=>{
-    setLoading(true, "در حال دریافت آخرین نسخه از سرور...");
-    try{
+    openModal(`<h3>دریافت از سرور</h3><p class="hint">در حال بارگذاری لیست نسخه‌ها...</p>`);
+    let backups = [];
+    try{ backups = await fetchJsonSafe("/api/backups", { headers: authHeaders() }); }catch(e){}
+    const liveOption = { key: "__live__", type: "live", label: "آخرین نسخه‌ی زنده (فعلی سرور)", savedAt: null };
+    renderPullPicker([liveOption, ...backups]);
+  });
+}
+
+function renderPullPicker(list){
+  let html = `<h3>دریافت از سرور</h3><p class="hint">کدوم نسخه رو بارگذاری کنم؟</p><div style="max-height:340px;overflow:auto;margin-bottom:12px;">`;
+  list.forEach((b,i)=>{
+    const when = b.savedAt ? new Date(b.savedAt).toLocaleString("fa-IR") : "همین الان";
+    const typeLabel = b.type === "live" ? "زنده" : b.type === "monthly" ? "ماهانه (خودکار)" : "دستی";
+    html += `<div class="global-search-item" data-idx="${i}">
+      <div class="global-search-item-title">${escapeHtml(b.label || typeLabel)}</div>
+      <div class="global-search-item-meta">${typeLabel} — ${when}</div>
+    </div>`;
+  });
+  html += `</div><div class="modal-actions"><button class="btn btn-outline" onclick="window.__closeModal()">انصراف</button></div>`;
+  openModal(html);
+  document.querySelectorAll(".global-search-item").forEach(el=>{
+    el.addEventListener("click", async ()=>{
+      const b = list[parseInt(el.dataset.idx,10)];
+      closeModal();
+      await doPullVersion(b);
+    });
+  });
+}
+
+async function doPullVersion(b){
+  setLoading(true, "در حال دریافت...");
+  try{
+    let parsed;
+    if(b.key === "__live__"){
       const res = await fetch(SYNC_API, { headers: authHeaders() });
       if(res.status === 401){ authToken=null; authInfo=null; saveAuthToStorage(); setLoading(false); showToast("نشستت منقضی شده، دوباره وارد شو", "err"); return; }
       const text = await res.text();
-      let parsed;
       try{ parsed = JSON.parse(text); }
       catch(e){ throw new Error("سرور جواب معتبر نداد؛ احتمالاً /api/data هنوز دیپلوی نشده (کد " + res.status + ")"); }
       if(!res.ok) throw new Error((parsed && parsed.error) || ("خطای سرور " + res.status));
-      if(!parsed){ setLoading(false); showToast("هنوز چیزی روی سرور ذخیره نشده", "err"); return; }
-      await applyBackupObject(parsed);
       lastServerSnapshot = text;
-      markClean();
-      setLoading(false);
-      showToast("آخرین نسخه از سرور دریافت شد", "ok");
-      if(pasazhIndex.length) await switchToPasazh(currentPasazhId || pasazhIndex[0].id);
-      else renderPasazhSelect();
-    }catch(e){
-      setLoading(false);
-      showToast("خطا در دریافت از سرور: " + (e.message||""), "err");
+    } else {
+      const data = await fetchJsonSafe("/api/backups?key=" + encodeURIComponent(b.key), { headers: authHeaders() });
+      parsed = data.payload;
     }
-  });
+    if(!parsed){ setLoading(false); showToast("هنوز چیزی روی سرور ذخیره نشده", "err"); return; }
+    await applyBackupObject(parsed);
+    markClean();
+    setLoading(false);
+    showToast("نسخه‌ی انتخابی بارگذاری شد", "ok");
+    if(pasazhIndex.length) await switchToPasazh(currentPasazhId || pasazhIndex[0].id);
+    else renderPasazhSelect();
+  }catch(e){
+    setLoading(false);
+    showToast("خطا در دریافت از سرور: " + (e.message||""), "err");
+  }
 }
 
 async function pushToServer(){
-  ensureLoggedIn(async ()=>{
-    setLoading(true, "در حال ارسال به سرور...");
-    try{
-      const all = await buildBackupObject();
-      const bodyStr = JSON.stringify(all);
-      const res = await fetch(SYNC_API, {
-        method: "POST",
-        headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
-        body: bodyStr
+  ensureLoggedIn(()=>{
+    if(authInfo && authInfo.role === "admin"){
+      openModal(`
+        <h3>ارسال به سرور</h3>
+        <p class="hint">این نسخه با چه اسمی تو لیست بکاپ‌های سرور ذخیره بشه؟ (اختیاری)</p>
+        <div class="field"><input type="text" id="pushLabelInput" placeholder="مثلاً: قبل از تغییرات بزرگ"></div>
+        <div class="modal-actions">
+          <button class="btn btn-brass" id="confirmPushBtn">ارسال</button>
+          <button class="btn btn-outline" onclick="window.__closeModal()">انصراف</button>
+        </div>`);
+      document.getElementById("confirmPushBtn").addEventListener("click", ()=>{
+        const label = document.getElementById("pushLabelInput").value.trim();
+        closeModal();
+        doPushToServer(label);
       });
-      if(res.status === 401){ authToken=null; authInfo=null; saveAuthToStorage(); setLoading(false); showToast("نشستت منقضی شده، دوباره وارد شو", "err"); return; }
-      if(!res.ok) throw new Error("server responded " + res.status);
-      lastServerSnapshot = bodyStr;
-      markClean();
-      setLoading(false);
-      showToast(authInfo && authInfo.role === "admin" ? "اطلاعات با موفقیت روی سرور ذخیره شد" : "تغییرات پاساژهای مجاز تو ارسال شد", "ok");
-      if(authInfo && authInfo.role === "admin") createManualBackupSnapshot();
-    }catch(e){
-      setLoading(false);
-      showToast("خطا در ارسال به سرور: " + (e.message||""), "err");
+    } else {
+      doPushToServer("");
     }
   });
 }
 
-async function createManualBackupSnapshot(){
+async function doPushToServer(label){
+  setLoading(true, "در حال ارسال به سرور...");
+  try{
+    const all = await buildBackupObject();
+    const bodyStr = JSON.stringify(all);
+    const res = await fetch(SYNC_API, {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      body: bodyStr
+    });
+    if(res.status === 401){ authToken=null; authInfo=null; saveAuthToStorage(); setLoading(false); showToast("نشستت منقضی شده، دوباره وارد شو", "err"); return; }
+    if(!res.ok) throw new Error("server responded " + res.status);
+    lastServerSnapshot = bodyStr;
+    markClean();
+    setLoading(false);
+    showToast(authInfo && authInfo.role === "admin" ? "اطلاعات با موفقیت روی سرور ذخیره شد" : "تغییرات پاساژهای مجاز تو ارسال شد", "ok");
+    if(authInfo && authInfo.role === "admin") createManualBackupSnapshot(label);
+  }catch(e){
+    setLoading(false);
+    showToast("خطا در ارسال به سرور: " + (e.message||""), "err");
+  }
+}
+
+async function createManualBackupSnapshot(label){
   try{
     await fetch("/api/backups", {
       method: "POST",
       headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
-      body: JSON.stringify({ type: "manual" })
+      body: JSON.stringify({ type: "manual", label: label || "" })
     });
-  }catch(e){ /* silent — backup browsing will just be missing this one entry */ }
+  }catch(e){ /* silent */ }
 }
 
 /* ---- Auto-sync: near-real-time background pull/push (polling-based) ---- */
@@ -2876,17 +2945,59 @@ async function fetchJsonSafe(url, opts){
 
 /* ---- Floor map with clickable pins ---- */
 let mapViewActive = null; // floor object when the full-page map view is showing
+let selectedPinRowId = null; // stays highlighted until another pin is clicked
 
 function openFloorMapView(floor){
   ensureLoggedIn(()=>{
     floor.mapPins = floor.mapPins || [];
     mapViewActive = floor;
+    selectedPinRowId = null;
     renderMain();
   });
 }
 function closeFloorMapView(){
   mapViewActive = null;
   renderMain();
+}
+
+const PIN_STATUS_COLORS = {
+  vacant:        { color: "#9AA3AE", label: "خالی / بدون اطلاعات مالک" },
+  ownerOther:    { color: "#E8B93E", label: "مالک خودشه (غیر از علاالدین)" },
+  ownerAlaeddin: { color: "#B98D3E", label: "مالک علاالدینه (خودش، بدون مستاجر)" },
+  rentedOther:   { color: "#D9714E", label: "اجاره رفته - دو ریالی (مالک غیر علاالدین)" },
+  rentedAlaeddin:{ color: "#4C7A5B", label: "اجاره رفته - یک ریالی (مالک علاالدین)" },
+};
+
+function getPinStatus(row, columns){
+  const ownerCol = findColumnByHints(columns, ["نام","مالک"]) || findColumnByHints(columns, ["مالک"]);
+  const statusCol = findColumnByHints(columns, ["وضعیت","واحد"]);
+  const tenantNameCol = findColumnByHints(columns, ["نام","مستاجر"]);
+  const ownerVal = ownerCol ? String(row[ownerCol]||"").trim() : "";
+  if(!ownerVal || ownerVal === "*") return "vacant";
+  const rented = isRentedRow(row, statusCol, tenantNameCol);
+  const isAlaeddin = isAlaeddinOwner(ownerVal);
+  if(rented) return isAlaeddin ? "rentedAlaeddin" : "rentedOther";
+  return isAlaeddin ? "ownerAlaeddin" : "ownerOther";
+}
+
+function pinPassesFilters(row, floor){
+  if(searchText.trim()){
+    const q = searchText.trim().toLowerCase();
+    if(!floor.columns.some(c=> String(row[c]||"").toLowerCase().includes(q))) return false;
+  }
+  if(onlyUpdated && !row.__updatedAt) return false;
+  if(dateFilter && !matchesDateFilter(row)) return false;
+  if(rialFilter && getRialType(row, floor.columns) !== rialFilter) return false;
+  if(expiryFilter && currentPasazhData.expirySettings.column){
+    if(getExpiryStatus(row, currentPasazhData.expirySettings.column) !== expiryFilter) return false;
+  }
+  return true;
+}
+
+function findRowByPin(floor, pin){
+  if(pin.rowId) return floor.rows.find(r=> r.__id === pin.rowId);
+  if(pin.rowIndex !== undefined) return floor.rows[pin.rowIndex]; // legacy fallback
+  return null;
 }
 
 function renderFloorMapView(floor){
@@ -2903,7 +3014,24 @@ function renderFloorMapView(floor){
       </div>
     </div>
     <h3 style="margin:10px 2px 6px;">نقشه‌ی طبقه‌ی «${escapeHtml(floor.name)}»</h3>
-    <p class="hint" style="margin:0 0 14px;">${hasImage ? 'روی عکس کلیک کن تا پین اضافه کنی. کلیک روی پین می‌بره سراغ اون واحد؛ کلیک راست حذفش می‌کنه.' : 'اول یه عکس از پلان طبقه آپلود کن.'}</p>
+    <p class="hint" style="margin:0 0 10px;">${hasImage ? 'روی عکس کلیک کن تا پین اضافه کنی. کلیک روی پین می‌بره سراغ اون واحد و رنگی می‌مونه؛ کلیک راست حذفش می‌کنه.' : 'اول یه عکس از پلان طبقه آپلود کن.'}</p>
+    ${hasImage ? `
+    <div class="toolbar">
+      <input type="text" id="mapSearchInput" placeholder="جستجو..." value="${escapeHtml(searchText)}">
+      <select class="filter-select" id="mapRialSelect">
+        <option value="">نوع اجاره: همه</option>
+        <option value="یک ریالی" ${rialFilter==="یک ریالی"?"selected":""}>یک ریالی</option>
+        <option value="دو ریالی" ${rialFilter==="دو ریالی"?"selected":""}>دو ریالی</option>
+      </select>
+      ${currentPasazhData.expirySettings.column ? `
+      <select class="filter-select" id="mapExpirySelect">
+        <option value="">وضعیت قرارداد: همه</option>
+        <option value="expired" ${expiryFilter==="expired"?"selected":""}>منقضی‌شده</option>
+        <option value="soon" ${expiryFilter==="soon"?"selected":""}>نزدیک انقضا</option>
+      </select>` : ''}
+      <button class="btn btn-outline small" id="mapClearFiltersBtn">پاک‌کردن فیلترها</button>
+    </div>
+    <div class="map-legend" id="mapLegend"></div>` : ''}
     <div id="floorMapArea"></div>
   `;
 
@@ -2914,7 +3042,7 @@ function renderFloorMapView(floor){
     if(!file) return;
     setLoading(true, "در حال آپلود عکس نقشه...");
     try{
-      const dataUrl = await resizeImageToDataUrl(file, 1600, 0.8);
+      const dataUrl = await resizeImageToDataUrl(file, 2000, 0.85);
       const data = await fetchJsonSafe("/api/upload", {
         method: "POST",
         headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
@@ -2942,12 +3070,29 @@ function renderFloorMapView(floor){
 
   if(hasImage){
     document.getElementById("floorMapArea").innerHTML = `
-      <div id="floorMapImgWrap" style="position:relative;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:crosshair;max-width:900px;">
+      <div id="floorMapImgWrap" style="position:relative;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:crosshair;width:100%;">
         <img id="floorMapImg" style="width:100%;display:block;" />
         <div id="floorMapPinsLayer" style="position:absolute;inset:0;"></div>
       </div>`;
+    renderMapLegend();
+    document.getElementById("mapSearchInput").addEventListener("input", (e)=>{ searchText = e.target.value; renderMapPins(floor); });
+    document.getElementById("mapRialSelect").addEventListener("change", (e)=>{ rialFilter = e.target.value || null; renderMapPins(floor); });
+    const expSel = document.getElementById("mapExpirySelect");
+    if(expSel) expSel.addEventListener("change", (e)=>{ expiryFilter = e.target.value || null; renderMapPins(floor); });
+    document.getElementById("mapClearFiltersBtn").addEventListener("click", ()=>{
+      searchText = ""; rialFilter = null; expiryFilter = null; onlyUpdated = false; dateFilter = null;
+      renderFloorMapView(floor);
+    });
     loadAndRenderMapImage(floor);
   }
+}
+
+function renderMapLegend(){
+  const box = document.getElementById("mapLegend");
+  if(!box) return;
+  box.innerHTML = Object.values(PIN_STATUS_COLORS).map(s=>
+    `<span class="map-legend-item"><span class="map-legend-dot" style="background:${s.color}"></span>${escapeHtml(s.label)}</span>`
+  ).join("");
 }
 
 async function loadAndRenderMapImage(floor){
@@ -2975,18 +3120,25 @@ function renderMapPins(floor){
   if(!layer) return;
   layer.innerHTML = "";
   (floor.mapPins || []).forEach(pin=>{
+    const row = findRowByPin(floor, pin);
+    if(!row) return;
+    if(!pinPassesFilters(row, floor)) return;
+
+    const status = getPinStatus(row, floor.columns);
+    const isSelected = selectedPinRowId && row.__id === selectedPinRowId;
     const dot = document.createElement("div");
-    dot.className = "map-pin";
+    dot.className = "map-pin" + (isSelected ? " selected" : "");
     dot.style.left = pin.x + "%";
     dot.style.top = pin.y + "%";
+    dot.style.background = isSelected ? "#2E6BE0" : PIN_STATUS_COLORS[status].color;
     dot.title = (pin.label || "") + " — کلیک برای رفتن، کلیک راست برای حذف";
     dot.addEventListener("click", (e)=>{
       e.stopPropagation();
-      const row = floor.rows[pin.rowIndex];
-      if(!row){ showToast("این واحد پیدا نشد (شاید حذف شده)", "err"); return; }
+      selectedPinRowId = row.__id;
+      renderMapPins(floor);
       const floorIdx = currentPasazhData.floors.indexOf(floor);
       currentFloorIdx = floorIdx;
-      flashRowIdx = pin.rowIndex;
+      flashRowIdx = floor.rows.indexOf(row);
       mapViewActive = null;
       renderFloorRail(); renderMain();
     });
@@ -3019,7 +3171,7 @@ function openAddPinModal(floor, x, y){
     const row = floor.rows[rowIndex];
     const label = floor.columns.slice(0,2).map(c=>row[c]).filter(v=>v && v!=="*").join(" - ");
     floor.mapPins = floor.mapPins || [];
-    floor.mapPins.push({ x, y, rowIndex, label });
+    floor.mapPins.push({ x, y, rowId: row.__id, label });
     markDirty();
     closeModal();
     renderMapPins(floor);
@@ -3033,74 +3185,109 @@ function openMapExportModal(floor){
   openModal(`
     <h3>خروجی تصویر نقشه</h3>
     <p class="hint">کدوم فیلدها زیر هر پین نوشته بشه؟ (مثلاً نام مالک، تاریخ اجاره)</p>
-    <div style="max-height:260px;overflow:auto;">${checks}</div>
+    <div style="max-height:220px;overflow:auto;">${checks}</div>
+    <div class="field"><label>اندازه‌ی فونت (تا وسط هم نیفته/بیرون نزنه خودت تنظیمش کن)</label><input type="number" id="mapFontSizeInput" value="13" min="8" max="28"></div>
     <div class="modal-actions">
-      <button class="btn btn-brass" id="confirmMapExportBtn">ساخت خروجی</button>
+      <button class="btn btn-brass" id="previewMapExportBtn">پیش‌نمایش</button>
       <button class="btn btn-outline" onclick="window.__closeModal()">انصراف</button>
     </div>`);
-  document.getElementById("confirmMapExportBtn").addEventListener("click", async ()=>{
+  document.getElementById("previewMapExportBtn").addEventListener("click", async ()=>{
     const cols = Array.from(document.querySelectorAll(".map-export-col-check:checked")).map(el=>el.value);
     if(cols.length === 0){ showToast("حداقل یه فیلد انتخاب کن", "err"); return; }
-    closeModal();
-    await generateMapExportImage(floor, cols);
+    const fontSize = parseInt(document.getElementById("mapFontSizeInput").value, 10) || 13;
+    await openMapExportPreview(floor, cols, fontSize);
   });
 }
 
-async function generateMapExportImage(floor, cols){
-  setLoading(true, "در حال ساخت خروجی تصویر...");
-  try{
-    const data = await fetchJsonSafe("/api/file?key=" + encodeURIComponent(floor.mapImageKey), { headers: authHeaders() });
-    const img = new Image();
-    await new Promise((resolve,reject)=>{ img.onload = resolve; img.onerror = reject; img.src = data.dataUrl; });
+async function buildMapExportCanvas(floor, cols, fontSize){
+  const data = await fetchJsonSafe("/api/file?key=" + encodeURIComponent(floor.mapImageKey), { headers: authHeaders() });
+  const img = new Image();
+  await new Promise((resolve,reject)=>{ img.onload = resolve; img.onerror = reject; img.src = data.dataUrl; });
 
-    const canvas = document.createElement("canvas");
-    canvas.width = img.width; canvas.height = img.height;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0);
+  const footerHeight = 34;
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width; canvas.height = img.height + footerHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(img, 0, 0);
 
-    (floor.mapPins || []).forEach(pin=>{
-      const row = floor.rows[pin.rowIndex];
-      if(!row) return;
-      const px = (pin.x/100) * canvas.width;
-      const py = (pin.y/100) * canvas.height;
+  (floor.mapPins || []).forEach(pin=>{
+    const row = findRowByPin(floor, pin);
+    if(!row) return;
+    const status = getPinStatus(row, floor.columns);
+    const px = (pin.x/100) * img.width;
+    const py = (pin.y/100) * img.height;
 
-      ctx.beginPath();
-      ctx.arc(px, py, 7, 0, Math.PI*2);
-      ctx.fillStyle = "#B98D3E";
-      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
-      ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(px, py, 6, 0, Math.PI*2);
+    ctx.fillStyle = PIN_STATUS_COLORS[status].color;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+    ctx.fill(); ctx.stroke();
 
-      const lines = cols.map(c=> row[c]).filter(v=> v && v !== "*").map(String);
-      ctx.font = "bold 14px Tahoma, sans-serif";
-      ctx.textAlign = "center";
-      let ty = py + 22;
-      lines.forEach(text=>{
-        const metrics = ctx.measureText(text);
-        const pad = 5;
-        ctx.fillStyle = "rgba(255,255,255,.92)";
-        ctx.fillRect(px - metrics.width/2 - pad, ty - 13, metrics.width + pad*2, 18);
-        ctx.strokeStyle = "rgba(27,36,48,.15)"; ctx.lineWidth = 1;
-        ctx.strokeRect(px - metrics.width/2 - pad, ty - 13, metrics.width + pad*2, 18);
-        ctx.fillStyle = "#1B2430";
-        ctx.fillText(text, px, ty);
-        ty += 19;
-      });
+    const lines = cols.map(c=> row[c]).filter(v=> v && v !== "*").map(String);
+    ctx.font = `bold ${fontSize}px Tahoma, sans-serif`;
+    ctx.textAlign = "center";
+    let ty = py + fontSize + 10;
+    lines.forEach(text=>{
+      const metrics = ctx.measureText(text);
+      const pad = 5;
+      const boxW = Math.min(metrics.width + pad*2, img.width - 10);
+      let bx = px;
+      if(bx - boxW/2 < 5) bx = 5 + boxW/2;
+      if(bx + boxW/2 > img.width - 5) bx = img.width - 5 - boxW/2;
+      ctx.fillStyle = "rgba(255,255,255,.92)";
+      ctx.fillRect(bx - boxW/2, ty - fontSize, boxW, fontSize + 5);
+      ctx.strokeStyle = "rgba(27,36,48,.15)"; ctx.lineWidth = 1;
+      ctx.strokeRect(bx - boxW/2, ty - fontSize, boxW, fontSize + 5);
+      ctx.fillStyle = "#1B2430";
+      ctx.fillText(text, bx, ty);
+      ty += fontSize + 6;
     });
+  });
 
-    canvas.toBlob((blob)=>{
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = `نقشه-${floor.name}-${fmtDateToday()}.png`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(()=> URL.revokeObjectURL(url), 5000);
-      setLoading(false);
-      showToast("تصویر خروجی آماده و دانلود شد", "ok");
-    }, "image/png");
+  ctx.fillStyle = "#1B2430";
+  ctx.fillRect(0, img.height, canvas.width, footerHeight);
+  ctx.fillStyle = "#EFEAE0";
+  ctx.font = "bold 14px Tahoma, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("طراحی و ساخت: سینا سپهرزاده", canvas.width/2, img.height + footerHeight/2 + 5);
+
+  return canvas;
+}
+
+async function openMapExportPreview(floor, cols, fontSize){
+  setLoading(true, "در حال ساخت پیش‌نمایش...");
+  try{
+    const canvas = await buildMapExportCanvas(floor, cols, fontSize);
+    setLoading(false);
+    const dataUrl = canvas.toDataURL("image/png");
+    openModal(`
+      <h3>پیش‌نمایش خروجی</h3>
+      <p class="hint">اگه فونت جابه‌جا/بزرگ بود، برگرد و اندازه رو عوض کن.</p>
+      <div style="max-height:60vh;overflow:auto;border:1px solid var(--line);border-radius:8px;"><img src="${dataUrl}" style="width:100%;display:block;"></div>
+      <div class="modal-actions">
+        <button class="btn btn-brass" id="downloadMapExportBtn">دانلود</button>
+        <button class="btn btn-outline" id="backToMapExportSettingsBtn">تغییر تنظیمات</button>
+        <button class="btn btn-outline" onclick="window.__closeModal()">بستن</button>
+      </div>`);
+    document.getElementById("downloadMapExportBtn").addEventListener("click", ()=>{
+      canvas.toBlob((blob)=>{
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `نقشه-${floor.name}-${fmtDateToday()}.png`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=> URL.revokeObjectURL(url), 5000);
+        showToast("تصویر دانلود شد", "ok");
+      }, "image/png");
+    });
+    document.getElementById("backToMapExportSettingsBtn").addEventListener("click", ()=> openMapExportModal(floor));
   }catch(e){
     setLoading(false);
-    showToast("خطا در ساخت خروجی: " + e.message, "err");
+    showToast("خطا در ساخت پیش‌نمایش: " + e.message, "err");
   }
 }
+
 
 /* ---- Attachments per unit (photos, scanned contracts, etc.) ---- */
 function openAttachmentsModal(row, onChange){
