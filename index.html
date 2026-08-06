@@ -2453,23 +2453,19 @@ async function doPullVersion(b){
 
 async function pushToServer(){
   ensureLoggedIn(()=>{
-    if(authInfo && authInfo.role === "admin"){
-      openModal(`
-        <h3>ارسال به سرور</h3>
-        <p class="hint">این نسخه با چه اسمی تو لیست بکاپ‌های سرور ذخیره بشه؟ (اختیاری)</p>
-        <div class="field"><input type="text" id="pushLabelInput" placeholder="مثلاً: قبل از تغییرات بزرگ"></div>
-        <div class="modal-actions">
-          <button class="btn btn-brass" id="confirmPushBtn">ارسال</button>
-          <button class="btn btn-outline" onclick="window.__closeModal()">انصراف</button>
-        </div>`);
-      document.getElementById("confirmPushBtn").addEventListener("click", ()=>{
-        const label = document.getElementById("pushLabelInput").value.trim();
-        closeModal();
-        doPushToServer(label);
-      });
-    } else {
-      doPushToServer("");
-    }
+    openModal(`
+      <h3>ارسال به سرور</h3>
+      <p class="hint">این نسخه با چه اسمی تو لیست بکاپ‌ها ذخیره بشه؟ (اختیاری)</p>
+      <div class="field"><input type="text" id="pushLabelInput" placeholder="مثلاً: قبل از تغییرات بزرگ"></div>
+      <div class="modal-actions">
+        <button class="btn btn-brass" id="confirmPushBtn">ارسال</button>
+        <button class="btn btn-outline" onclick="window.__closeModal()">انصراف</button>
+      </div>`);
+    document.getElementById("confirmPushBtn").addEventListener("click", ()=>{
+      const label = document.getElementById("pushLabelInput").value.trim();
+      closeModal();
+      doPushToServer(label);
+    });
   });
 }
 
@@ -2489,7 +2485,7 @@ async function doPushToServer(label){
     markClean();
     setLoading(false);
     showToast(authInfo && authInfo.role === "admin" ? "اطلاعات با موفقیت روی سرور ذخیره شد" : "تغییرات پاساژهای مجاز تو ارسال شد", "ok");
-    if(authInfo && authInfo.role === "admin") createManualBackupSnapshot(label);
+    createManualBackupSnapshot(label);
   }catch(e){
     setLoading(false);
     showToast("خطا در ارسال به سرور: " + (e.message||""), "err");
