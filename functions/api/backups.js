@@ -18,7 +18,7 @@ const PREFIX = "backup-";
 
 export async function onRequestPost({ request, env }) {
   const session = await verifySession(request, env);
-  if (!session || session.role !== "admin") return jsonResponse({ error: "فقط مدیر کل اجازه داره" }, 403);
+  if (!session) return jsonResponse({ error: "لطفاً وارد شو" }, 401);
   if (!env.PASAZH_KV) return jsonResponse({ error: "KV namespace وصل نشده (PASAZH_KV)" }, 500);
 
   let body;
@@ -28,6 +28,12 @@ export async function onRequestPost({ request, env }) {
     return jsonResponse({ error: "درخواست نامعتبر" }, 400);
   }
   const type = body.type === "monthly" ? "monthly" : "manual";
+
+  // بکاپ ماهانه‌ی خودکار فقط با مدیر کل ساخته می‌شه (چون از روی ورود مدیر تریگر می‌شه)
+  if (type === "monthly" && session.role !== "admin") {
+    return jsonResponse({ error: "فقط مدیر کل اجازه داره" }, 403);
+  }
+
   const label = (body.label || "").trim();
 
   const current = await env.PASAZH_KV.get(KV_KEY);
